@@ -217,7 +217,7 @@ class CrossUserStateTest extends PersistentWorkerTestCase
     }
 
     /**
-     * Backend\Traits\PreferenceMaker memoises preferences in a static keyed by widget and controller.
+     * Backend\Traits\PreferenceMaker memoizes preferences in a static keyed by widget and controller.
      *
      * The storage model behind it is scoped to one user, but the in-memory key was not, so under a
      * worker the entry one user filled was returned to the next. The key now includes the user, which

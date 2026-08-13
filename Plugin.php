@@ -65,21 +65,39 @@ class Plugin extends PluginBase
 
         /*
          * The reset only works when core exposes the worker-safety primitives it calls. On a core
-         * without them, registering Octane anyway would serve traffic with no request-boundary
-         * reset — cross-user state leaks — so registration is refused outright and the reason is
-         * logged. composer.json constrains winter/storm, but the system module ships inside the
-         * application rather than as an independently versioned dependency, so the storm
-         * constraint alone cannot prove the module-side primitives exist.
+         * without them, registering Octane anyway would either serve traffic with no
+         * request-boundary reset (cross-user state leaks) or throw an undefined-method Error at
+         * the first boundary (an outage), so registration is refused outright and the reason is
+         * logged. composer.json constrains winter/storm, but the modules ship inside the
+         * application and version independently of it, so every module-side manager the reset
+         * invokes is probed individually. An absent class is fine — an install without the CMS
+         * module has no ComponentManager to reset — but a present manager without the reset
+         * method means a version mismatch.
          */
-        if (!interface_exists(\Winter\Storm\Contracts\ResetsWorkerState::class)
+        $missing = !interface_exists(\Winter\Storm\Contracts\ResetsWorkerState::class)
             || !method_exists(\Winter\Storm\Exception\ErrorHandler::class, 'resetMaskState')
-            || !method_exists(\Winter\Storm\Halcyon\Model::class, 'flushRequestCache')
-            || !method_exists(\System\Classes\MailManager::class, 'resetWorkerState')
-        ) {
+            || !method_exists(\Winter\Storm\Halcyon\Model::class, 'flushRequestCache');
+
+        foreach ([
+            \System\Classes\MailManager::class,
+            \System\Classes\SettingsManager::class,
+            \Backend\Classes\NavigationManager::class,
+            \Backend\Classes\WidgetManager::class,
+            \Backend\Classes\AuthManager::class,
+            \Cms\Classes\ComponentManager::class,
+        ] as $manager) {
+            if (class_exists($manager) && !method_exists($manager, 'resetWorkerState')) {
+                $missing = true;
+                break;
+            }
+        }
+
+        if ($missing) {
             \Illuminate\Support\Facades\Log::warning(
                 'Winter.Octane: this Winter installation predates the worker-safety primitives '
-                . 'the plugin depends on, so Octane was not registered. Update Winter and Storm '
-                . 'to a version that ships ResetsWorkerState before serving through Octane.'
+                . 'the plugin depends on, so Octane was not registered. Update Winter (all '
+                . 'modules) and Storm to versions that ship ResetsWorkerState before serving '
+                . 'through Octane.'
             );
 
             return;

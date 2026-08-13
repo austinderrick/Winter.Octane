@@ -3,7 +3,6 @@
 namespace Winter\Octane\Tests;
 
 use System\Classes\PluginBase;
-use System\Classes\PluginManager;
 use Winter\Octane\Classes\ResetsRequestState;
 use Winter\Storm\Contracts\ResetsWorkerState;
 
@@ -57,17 +56,6 @@ class PluginResetDiscoveryTest extends PersistentWorkerTestCase
             };
         }
 
-        /*
-         * The plugin table is set directly rather than through registerPlugin(), which also wants a
-         * path on disk for language and view namespaces. What is under test is which plugins the reset
-         * selects, so the plugins only have to be present and enabled.
-         */
-        $manager    = PluginManager::instance();
-        $plugins    = new \ReflectionProperty($manager, 'plugins');
-        $normalized = new \ReflectionProperty($manager, 'normalizedMap');
-        $original   = $plugins->getValue($manager);
-        $originalNm = $normalized->getValue($manager);
-
         $fakes = [
             'Winter.Tests.ResetByMethod' => $byMethod,
             'Winter.Tests.ResetNeither'  => $neither,
@@ -77,18 +65,10 @@ class PluginResetDiscoveryTest extends PersistentWorkerTestCase
             $fakes['Winter.Tests.ResetByContract'] = $byContract;
         }
 
-        $plugins->setValue($manager, $fakes);
-        $normalized->setValue($manager, array_combine(array_keys($fakes), array_keys($fakes)));
-
-        try {
-            $reset  = new ResetsRequestState();
-            $invoke = new \ReflectionMethod($reset, 'resetPlugins');
-            $invoke->invoke($reset);
-        }
-        finally {
-            $plugins->setValue($manager, $original);
-            $normalized->setValue($manager, $originalNm);
-        }
+        $this->withFakePlugins($fakes, function () {
+            (new \ReflectionMethod(ResetsRequestState::class, 'resetPlugins'))
+                ->invoke(new ResetsRequestState());
+        });
 
         if ($byContract !== null) {
             $this->assertSame(
@@ -131,19 +111,9 @@ class PluginResetDiscoveryTest extends PersistentWorkerTestCase
             }
         };
 
-        $manager    = PluginManager::instance();
-        $plugins    = new \ReflectionProperty($manager, 'plugins');
-        $normalized = new \ReflectionProperty($manager, 'normalizedMap');
-        $original   = $plugins->getValue($manager);
-        $originalNm = $normalized->getValue($manager);
-
-        $fakes = ['Winter.Tests.FailingReset' => $failing];
-        $plugins->setValue($manager, $fakes);
-        $normalized->setValue($manager, array_combine(array_keys($fakes), array_keys($fakes)));
-
         \Illuminate\Support\Facades\Log::spy();
 
-        try {
+        $this->withFakePlugins(['Winter.Tests.FailingReset' => $failing], function () use ($app) {
             (new ResetsRequestState())->handle(new \Laravel\Octane\Events\WorkerErrorOccurred(
                 new \RuntimeException('the original operation failure'),
                 $app
@@ -159,18 +129,14 @@ class PluginResetDiscoveryTest extends PersistentWorkerTestCase
 
             try {
                 (new \ReflectionMethod(ResetsRequestState::class, 'resetPlugins'))
-                    ->invoke(new ResetsRequestState(), true);
+                    ->invoke(new ResetsRequestState());
             }
             catch (\RuntimeException $ex) {
                 $threw = true;
             }
 
             $this->assertTrue($threw, 'A failing plugin reset must still fail an ordinary operation.');
-        }
-        finally {
-            $plugins->setValue($manager, $original);
-            $normalized->setValue($manager, $originalNm);
-        }
+        });
     }
 }
 

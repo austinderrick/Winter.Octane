@@ -60,6 +60,25 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
      */
     public function setUp(): void
     {
+        /*
+         * Every Octane server entrypoint requires octane's bin/bootstrap.php, which sets
+         * APP_RUNNING_IN_CONSOLE = false before the worker's application exists, so inside a real
+         * worker runningInConsole() answers false — during provider registration and boot as much
+         * as during requests. Set before parent::setUp() creates the application, so the memo is
+         * computed with the production answer rather than patched afterwards, and boot-time
+         * branches on runningInConsole() take the path a worker would take.
+         */
+        $_ENV['APP_RUNNING_IN_CONSOLE'] = false;
+
+        /*
+         * A real worker process starts with empty statics. PHPUnit rebuilds the application per
+         * test in ONE process, so Halcyon's static cache-manager reference still points at the
+         * previous test's application while the next one registers its providers — and with
+         * console detection now answering false, the register-time flush would reach into that
+         * stale manager. Clearing it reproduces the fresh-process starting state.
+         */
+        \Winter\Storm\Halcyon\Model::setCacheManager(null);
+
         parent::setUp();
 
         if (!class_exists(\Laravel\Octane\Worker::class)) {
@@ -69,10 +88,48 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
 
     public function tearDown(): void
     {
+        unset($_ENV['APP_RUNNING_IN_CONSOLE']);
+
         $this->workerApplication = null;
         $this->workerResults = [];
 
         parent::tearDown();
+    }
+
+    /**
+     * Run a callback with the plugin manager's table swapped for the given fakes, restoring the
+     * original table afterwards even when the callback throws.
+     *
+     * The table is set by reflection rather than through registerPlugin(), which also wants a
+     * path on disk for language and view namespaces. Tests using this are about which plugins the
+     * reset selects, so the fakes only have to be present and enabled.
+     *
+     * @param array<string, \System\Classes\PluginBase> $fakes
+     * @param callable $callback
+     * @param bool $keepExisting Merge the fakes over the real table instead of replacing it.
+     * @return mixed The callback's return value.
+     */
+    protected function withFakePlugins(array $fakes, callable $callback, bool $keepExisting = false)
+    {
+        $manager    = \System\Classes\PluginManager::instance();
+        $plugins    = new \ReflectionProperty($manager, 'plugins');
+        $normalized = new \ReflectionProperty($manager, 'normalizedMap');
+
+        $originalPlugins = $plugins->getValue($manager);
+        $originalMap     = $normalized->getValue($manager);
+
+        $fakeMap = array_combine(array_keys($fakes), array_keys($fakes));
+
+        $plugins->setValue($manager, $keepExisting ? $originalPlugins + $fakes : $fakes);
+        $normalized->setValue($manager, $keepExisting ? $originalMap + $fakeMap : $fakeMap);
+
+        try {
+            return $callback();
+        }
+        finally {
+            $plugins->setValue($manager, $originalPlugins);
+            $normalized->setValue($manager, $originalMap);
+        }
     }
 
     /**
@@ -114,17 +171,6 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
         if ($this->workerApplication !== null) {
             return $this->workerApplication;
         }
-
-        /*
-         * Every Octane server entrypoint requires octane's bin/bootstrap.php, which sets
-         * APP_RUNNING_IN_CONSOLE = false before the worker's application is created, so inside a
-         * real worker runningInConsole() answers false. The test application booted from PHPUnit
-         * memoises the opposite answer, and code under test that branches on it — Winter's error
-         * handler does — would take the wrong path. The memo is corrected here rather than via the
-         * environment because the application has already been created by the time a test runs.
-         */
-        $memo = new \ReflectionProperty(\Illuminate\Foundation\Application::class, 'isRunningInConsole');
-        $memo->setValue($this->app, false);
 
         /*
          * A real worker binds its client into the base container, and several stock Octane

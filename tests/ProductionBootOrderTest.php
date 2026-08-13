@@ -33,9 +33,14 @@ class ProductionBootOrderTest extends PersistentWorkerTestCase
     {
         $app = require __DIR__ . '/../../../../bootstrap/app.php';
 
+        /*
+         * A fixture directory containing ONLY this plugin, not the host installation's plugins
+         * directory: registerAll() would otherwise register and boot every plugin installed on
+         * the site this suite happens to run inside, against an unmigrated in-memory database.
+         */
         $app->beforeBootstrapping(
             \Illuminate\Foundation\Bootstrap\RegisterProviders::class,
-            fn ($app) => $app->setPluginsPath(realpath(__DIR__ . '/../../..'))
+            fn ($app) => $app->setPluginsPath($this->fixturePluginsPath())
         );
 
         $app->make('Illuminate\Contracts\Console\Kernel')->bootstrap();
@@ -59,6 +64,24 @@ class ProductionBootOrderTest extends PersistentWorkerTestCase
         }
 
         return $app;
+    }
+
+    /**
+     * A plugins directory holding a single symlink to this plugin, created on first use.
+     *
+     * @return string
+     */
+    protected function fixturePluginsPath(): string
+    {
+        $path = sys_get_temp_dir() . '/winter-octane-boot-order-plugins';
+        $link = $path . '/winter/octane';
+
+        if (!is_link($link)) {
+            @mkdir($path . '/winter', 0755, true);
+            symlink(realpath(__DIR__ . '/..'), $link);
+        }
+
+        return $path;
     }
 
     /**
@@ -91,26 +114,11 @@ class ProductionBootOrderTest extends PersistentWorkerTestCase
             }
         };
 
-        $manager    = \System\Classes\PluginManager::instance();
-        $plugins    = new \ReflectionProperty($manager, 'plugins');
-        $normalized = new \ReflectionProperty($manager, 'normalizedMap');
-        $original   = $plugins->getValue($manager);
-        $originalNm = $normalized->getValue($manager);
-
-        $fakes = $original;
-        $fakes['Winter.Tests.OrderProbe'] = $probe;
-        $names = array_combine(array_keys($fakes), array_keys($fakes));
-
-        $plugins->setValue($manager, $fakes);
-        $normalized->setValue($manager, $names);
-
-        try {
-            $this->dispatchWorkerRequests(Request::create('/_worker/order', 'GET'));
-        }
-        finally {
-            $plugins->setValue($manager, $original);
-            $normalized->setValue($manager, $originalNm);
-        }
+        $this->withFakePlugins(
+            ['Winter.Tests.OrderProbe' => $probe],
+            fn () => $this->dispatchWorkerRequests(Request::create('/_worker/order', 'GET')),
+            keepExisting: true
+        );
 
         $this->assertSame(
             ['_worker/order'],

@@ -47,6 +47,42 @@ class ResetsRequestState
             return;
         }
 
+        /*
+         * On the WorkerErrorOccurred path, NOTHING here may throw. That event is dispatched from
+         * Worker::handleWorkerError(), inside the catch block of Worker::handle(); an exception
+         * escaping a listener there escapes the worker loop itself and kills the process with no
+         * graceful retirement. Any step can throw — an outdated module missing a reset method
+         * throws an Error, not just a misbehaving plugin — so the whole sequence is guarded, the
+         * failure is logged, and the next RequestReceived (unguarded) is what surfaces a
+         * persistent fault.
+         */
+        if ($event instanceof \Laravel\Octane\Events\WorkerErrorOccurred) {
+            try {
+                $this->reset($base, $sandbox);
+            }
+            catch (Throwable $ex) {
+                Log::error(sprintf(
+                    'Winter.Octane: the request-state reset failed while the worker was already '
+                    . 'handling an error: %s',
+                    $ex->getMessage()
+                ), ['exception' => $ex]);
+            }
+
+            return;
+        }
+
+        $this->reset($base, $sandbox);
+    }
+
+    /**
+     * Discard the state the previous operation produced.
+     *
+     * @param \Illuminate\Contracts\Foundation\Application|null $base
+     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @return void
+     */
+    protected function reset($base, Application $sandbox): void
+    {
         $this->forgetExecutionContext($base, $sandbox);
         $this->resetCoreState();
         $this->resetManagers($base, $sandbox);
@@ -54,15 +90,7 @@ class ResetsRequestState
         $this->resetSharedViewData($base, $sandbox);
         $this->rollBackTransactions($base, $sandbox);
         $this->flushRouteController($sandbox);
-
-        /*
-         * A plugin reset that throws fails the operation — except while handling
-         * WorkerErrorOccurred, which is dispatched from inside Octane's error path. Throwing there
-         * would run ahead of Octane's own ReportException and StopWorkerIfNecessary listeners,
-         * swallowing the report of the original failure and preventing the worker from being
-         * retired. On that path the failure is logged instead.
-         */
-        $this->resetPlugins(!$event instanceof \Laravel\Octane\Events\WorkerErrorOccurred);
+        $this->resetPlugins();
     }
 
     /**
@@ -182,7 +210,7 @@ class ResetsRequestState
     /**
      * Per-request caches held in static properties, as class => [property => value after reset].
      *
-     * These are memoised for the duration of one request by design, but a static property outlives
+     * These are memoized for the duration of one request by design, but a static property outlives
      * the operation that filled it. Reaching them by reflection keeps the change to a single place
      * rather than adding a reset method to a dozen unrelated classes; the accompanying manifest test
      * asserts every entry still exists, so a rename fails a test instead of silently disabling a
@@ -295,7 +323,7 @@ class ResetsRequestState
         $this->resetTraitStaticCaches();
 
         /*
-         * The active and edit theme are memoised in statics and also cached externally. Only the
+         * The active and edit theme are memoized in statics and also cached externally. Only the
          * in-memory copy is cleared: the external entries have their own invalidation, and forgetting
          * them every operation would defeat the cache entirely.
          */
@@ -433,15 +461,15 @@ class ResetsRequestState
     }
 
     /**
-     * Shared view-factory keys present when the worker served its first operation, or null before
-     * the first pass has recorded them.
+     * The view factory's shared data as it stood when the worker served its first operation, or
+     * null before the first pass has recorded it.
      *
-     * @var list<string>|null
+     * @var array<string, mixed>|null
      */
     protected static ?array $sharedViewBaseline = null;
 
     /**
-     * Discard view data shared during the previous operation, keeping boot-time shares.
+     * Restore the view factory's shared data to its boot-time state.
      *
      * Resetting System\Helpers\View::$globalVarCache alone is not enough: that static is only a
      * memo of the view factory's real shared-data array, and the factory itself is resolved into
@@ -450,10 +478,15 @@ class ResetsRequestState
      *
      * The factory cannot simply be emptied either — providers share legitimate data at boot (the
      * app name, for one) that every later operation is entitled to. The first reset runs before
-     * any request code has executed, so the keys present then are exactly the boot-time set; each
-     * later reset drops whatever keys have appeared since. Values of baseline keys are left as
-     * they are: restoring snapshots of them would pin objects from the boot request for the life
-     * of the worker.
+     * any request code has executed, so the entries present then are exactly the boot-time set,
+     * and each later reset restores that snapshot wholesale. Restoring values, not just dropping
+     * added keys, matters: a request that OVERWRITES a boot-time key (a per-site app name, say)
+     * would otherwise hand its value to every later request on the worker.
+     *
+     * The consequence is that a share made during a request lives exactly as long as under
+     * PHP-FPM: one operation. A provider first booted mid-request that shares data once must
+     * share per request instead (or use a view composer) to work on a worker; a boundary reset
+     * cannot tell that share apart from request state, and keeping it would keep the leaks too.
      *
      * @param \Illuminate\Contracts\Foundation\Application|null $base
      * @param \Illuminate\Contracts\Foundation\Application $sandbox
@@ -469,10 +502,8 @@ class ResetsRequestState
             return;
         }
 
-        $shared = $factory->getShared();
-
         if (static::$sharedViewBaseline === null) {
-            static::$sharedViewBaseline = array_keys($shared);
+            static::$sharedViewBaseline = $factory->getShared();
 
             return;
         }
@@ -483,10 +514,7 @@ class ResetsRequestState
             return;
         }
 
-        $reflection->getProperty('shared')->setValue(
-            $factory,
-            array_intersect_key($shared, array_flip(static::$sharedViewBaseline))
-        );
+        $reflection->getProperty('shared')->setValue($factory, static::$sharedViewBaseline);
     }
 
     /**
@@ -590,17 +618,14 @@ class ResetsRequestState
      * plugin that always throws makes the worker fail every request rather than quietly degrade, which
      * is what forces it to be fixed.
      *
-     * The one exception is the WorkerErrorOccurred path, where $failFast is false: that event is
-     * dispatched from inside Octane's own error handling, and a throw from here would pre-empt the
-     * listeners that report the original failure and retire the worker. There the failure is logged,
-     * the remaining plugins are still reset, and the next RequestReceived — where $failFast is true
-     * again — is what surfaces a persistently broken plugin.
+     * The WorkerErrorOccurred path is the one place this throw does not propagate: handle() wraps
+     * the entire reset sequence there, because that event is dispatched from inside the worker
+     * loop's catch block, where an escaping exception kills the process outright.
      *
-     * @param bool $failFast Throw on a failed plugin reset rather than logging it.
      * @return void
      * @throws \RuntimeException
      */
-    protected function resetPlugins(bool $failFast = true): void
+    protected function resetPlugins(): void
     {
         $pluginManager = PluginManager::instance();
 
@@ -613,20 +638,11 @@ class ResetsRequestState
                 $plugin->resetWorkerState();
             }
             catch (Throwable $ex) {
-                if ($failFast) {
-                    throw new \RuntimeException(sprintf(
-                        'Plugin %s failed to reset its worker state: %s',
-                        $identifier,
-                        $ex->getMessage()
-                    ), 0, $ex);
-                }
-
-                Log::error(sprintf(
-                    'Winter.Octane: plugin %s failed to reset its worker state while the worker '
-                    . 'was already handling an error: %s',
+                throw new \RuntimeException(sprintf(
+                    'Plugin %s failed to reset its worker state: %s',
                     $identifier,
                     $ex->getMessage()
-                ), ['exception' => $ex]);
+                ), 0, $ex);
             }
         }
     }

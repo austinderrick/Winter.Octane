@@ -1,0 +1,26 @@
+{
+    "name": "winter/wn-octane-plugin",
+    "type": "winter-plugin",
+    "description": "Serves Winter CMS from a persistent application server (FrankenPHP, Swoole or RoadRunner) via Laravel Octane.",
+    "keywords": ["winter", "cms", "octane", "frankenphp", "swoole", "roadrunner", "worker", "performance"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Derrick Austin",
+            "email": "derrick.austin@interworks.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "composer/installers": "~1.0 || ~2.0",
+        "laravel/octane": "^2.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Winter\\Octane\\": ""
+        }
+    },
+    "extra": {
+        "installer-name": "octane"
+    }
+}

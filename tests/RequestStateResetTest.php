@@ -195,6 +195,49 @@ class RequestStateResetTest extends PersistentWorkerTestCase
     }
 
     /**
+     * A request that OVERWRITES a boot-time view share must not hand its value to later requests.
+     *
+     * Dropping keys added since boot is not enough. A multi-site plugin overwriting a boot-time
+     * key per request (a site-specific app name, say) leaves the key present, so a keys-only
+     * cleanup keeps the previous request's VALUE. The reset restores the boot-time value itself.
+     */
+    public function testOverwritingABootTimeShareDoesNotLeakIntoTheNextRequest()
+    {
+        $app = $this->bootWorker();
+
+        /*
+         * Shared before the first operation, so the worker's baseline records it as boot state.
+         */
+        $app['view']->share('octaneBaselineShare', 'boot-value');
+
+        $seen = [];
+
+        $this->addWorkerRoute('_worker/overwrite-set', function () {
+            \Illuminate\Support\Facades\View::share('octaneBaselineShare', 'request-one-value');
+
+            return 'overwritten';
+        });
+
+        $this->addWorkerRoute('_worker/overwrite-read', function () use (&$seen) {
+            $seen[] = app('view')->getShared()['octaneBaselineShare'] ?? null;
+
+            return 'read';
+        });
+
+        $this->dispatchWorkerRequests(
+            Request::create('/_worker/overwrite-set', 'GET'),
+            Request::create('/_worker/overwrite-read', 'GET')
+        );
+
+        $this->assertSame(
+            ['boot-value'],
+            $seen,
+            'A boot-time share overwritten during one request must return to its boot-time value '
+            . 'for the next.'
+        );
+    }
+
+    /**
      * The auth manager is resolved into the base container at boot, so the sandbox never discards
      * it and a resolved user would otherwise be visible to the next request.
      */

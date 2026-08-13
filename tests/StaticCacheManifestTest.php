@@ -100,8 +100,13 @@ class StaticCacheManifestTest extends PluginTestCase
     }
 
     /**
-     * The reset value must be type-compatible with the property's declared default, so resetting
-     * cannot introduce a type error on the next read.
+     * The reset value must equal the property's declared default exactly.
+     *
+     * Type compatibility is not enough. Several of these caches use null as their "rebuild on next
+     * read" sentinel; resetting one of those to [] is type-compatible and silently disables the
+     * rebuild, so the cache serves emptiness for the rest of the worker's life. An earlier version
+     * of this test allowed any reset value where the default was null, and that loophole let
+     * exactly that bug ship for the view-global and mail-layout caches.
      */
     public function testResetValuesMatchTheDeclaredDefaults()
     {
@@ -119,16 +124,14 @@ class StaticCacheManifestTest extends PluginTestCase
                     continue;
                 }
 
-                $default = $defaults[$property];
-
-                // A null default accepts any reset value; otherwise the types should agree.
-                if ($default !== null && gettype($default) !== gettype($value)) {
+                if ($defaults[$property] !== $value) {
                     $problems[] = sprintf(
-                        '%s::$%s defaults to %s but is reset to %s',
+                        '%s::$%s defaults to %s but is reset to %s; the reset must restore the '
+                        . 'declared default, which is the value the class treats as "not yet built"',
                         $class,
                         $property,
-                        gettype($default),
-                        gettype($value)
+                        var_export($defaults[$property], true),
+                        var_export($value, true)
                     );
                 }
             }

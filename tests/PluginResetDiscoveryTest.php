@@ -109,6 +109,69 @@ class PluginResetDiscoveryTest extends PersistentWorkerTestCase
             'A plugin providing neither the contract nor the method should be skipped.'
         );
     }
+
+    /**
+     * On the WorkerErrorOccurred path a failed plugin reset is logged, not thrown.
+     *
+     * That event is dispatched from inside Octane's own error handling. A throw from the reset
+     * there would run ahead of Octane's ReportException and StopWorkerIfNecessary listeners,
+     * swallowing the report of the original failure and preventing the worker from being retired.
+     * The ordinary path must keep throwing: the next RequestReceived is what surfaces a
+     * persistently broken plugin.
+     */
+    public function testAFailingResetIsLoggedNotThrownWhileHandlingAWorkerError(): void
+    {
+        $app = $this->bootWorker();
+
+        $failing = new class ($app) extends PluginBase
+        {
+            public function resetWorkerState(): void
+            {
+                throw new \RuntimeException('deliberate reset failure');
+            }
+        };
+
+        $manager    = PluginManager::instance();
+        $plugins    = new \ReflectionProperty($manager, 'plugins');
+        $normalized = new \ReflectionProperty($manager, 'normalizedMap');
+        $original   = $plugins->getValue($manager);
+        $originalNm = $normalized->getValue($manager);
+
+        $fakes = ['Winter.Tests.FailingReset' => $failing];
+        $plugins->setValue($manager, $fakes);
+        $normalized->setValue($manager, array_combine(array_keys($fakes), array_keys($fakes)));
+
+        \Illuminate\Support\Facades\Log::spy();
+
+        try {
+            (new ResetsRequestState())->handle(new \Laravel\Octane\Events\WorkerErrorOccurred(
+                new \RuntimeException('the original operation failure'),
+                $app
+            ));
+
+            \Illuminate\Support\Facades\Log::shouldHaveReceived('error')->once();
+
+            /*
+             * Same failing plugin, ordinary path: the throw must survive, or a broken plugin
+             * degrades into a silent per-request log line.
+             */
+            $threw = false;
+
+            try {
+                (new \ReflectionMethod(ResetsRequestState::class, 'resetPlugins'))
+                    ->invoke(new ResetsRequestState(), true);
+            }
+            catch (\RuntimeException $ex) {
+                $threw = true;
+            }
+
+            $this->assertTrue($threw, 'A failing plugin reset must still fail an ordinary operation.');
+        }
+        finally {
+            $plugins->setValue($manager, $original);
+            $normalized->setValue($manager, $originalNm);
+        }
+    }
 }
 
 /**

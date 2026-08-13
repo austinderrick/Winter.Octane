@@ -116,6 +116,17 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
         }
 
         /*
+         * Every Octane server entrypoint requires octane's bin/bootstrap.php, which sets
+         * APP_RUNNING_IN_CONSOLE = false before the worker's application is created, so inside a
+         * real worker runningInConsole() answers false. The test application booted from PHPUnit
+         * memoises the opposite answer, and code under test that branches on it — Winter's error
+         * handler does — would take the wrong path. The memo is corrected here rather than via the
+         * environment because the application has already been created by the time a test runs.
+         */
+        $memo = new \ReflectionProperty(\Illuminate\Foundation\Application::class, 'isRunningInConsole');
+        $memo->setValue($this->app, false);
+
+        /*
          * A real worker binds its client into the base container, and several stock Octane
          * listeners resolve it — StopWorkerIfNecessary does so while handling WorkerErrorOccurred.
          * Binding a no-op client keeps those listeners on their production code path.

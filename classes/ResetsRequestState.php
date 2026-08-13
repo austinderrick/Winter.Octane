@@ -2,6 +2,7 @@
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\DatabaseTransactionsManager;
+use Illuminate\Support\Facades\Log;
 use System\Classes\PluginManager;
 use System\Twig\Loader as TwigLoader;
 use Throwable;
@@ -50,9 +51,18 @@ class ResetsRequestState
         $this->resetCoreState();
         $this->resetManagers($base, $sandbox);
         $this->resetStaticCaches();
+        $this->resetSharedViewData($base, $sandbox);
         $this->rollBackTransactions($base, $sandbox);
         $this->flushRouteController($sandbox);
-        $this->resetPlugins();
+
+        /*
+         * A plugin reset that throws fails the operation — except while handling
+         * WorkerErrorOccurred, which is dispatched from inside Octane's error path. Throwing there
+         * would run ahead of Octane's own ReportException and StopWorkerIfNecessary listeners,
+         * swallowing the report of the original failure and preventing the worker from being
+         * retired. On that path the failure is logged instead.
+         */
+        $this->resetPlugins(!$event instanceof \Laravel\Octane\Events\WorkerErrorOccurred);
     }
 
     /**
@@ -203,13 +213,32 @@ class ResetsRequestState
         // sees under PHP-FPM.
         \System\Classes\ImageResizer::class => ['availableSources' => []],
 
-        // Request-shared view globals, which can be returned to a different user.
-        \System\Helpers\View::class => ['globalVarCache' => []],
+        // Request-shared view globals, which can be returned to a different user. The reset value
+        // must be null, not []: null is the property's "rebuild on next read" sentinel, and an
+        // empty array would be served as the (empty) globals for the rest of the worker's life.
+        \System\Helpers\View::class => ['globalVarCache' => null],
 
-        // Database-backed mail layouts, parameters and plugin versions.
-        \System\Models\MailLayout::class => ['codeCache' => []],
+        // Database-backed mail layouts, parameters and plugin versions. MailLayout's cache uses
+        // null as its rebuild sentinel for the same reason as the view globals above.
+        \System\Models\MailLayout::class => ['codeCache' => null],
         \System\Models\Parameter::class => ['cache' => []],
         \System\Models\PluginVersion::class => ['versionCache' => null],
+
+        // Backend user preferences. The behavior declares its own $instances cache, separate from
+        // the SettingsModel storage reset above, keyed by record code only — but the record it
+        // holds belongs to one user, so a stale entry serves user A's preferences to user B and
+        // lets B's save overwrite A's row.
+        \Backend\Behaviors\UserPreferencesModel::class => ['instances' => []],
+
+        // Set when a repeater "add item" AJAX call is handled, and read by every Repeater instance
+        // in the process to decide whether to skip processItems(). Left set, one user's add-row
+        // action disables repeater processing for every later request the worker serves.
+        \Backend\FormWidgets\Repeater::class => ['onAddItemCalled' => false],
+
+        // Per-user auth preference values, keyed by user and preference. Not a cross-user leak on
+        // its own, but under PHP-FPM the cache lived for one request; per-worker it would grow
+        // without bound and serve values gone stale in the database indefinitely.
+        \Winter\Storm\Auth\Models\Preferences::class => ['cache' => []],
     ];
 
     /**
@@ -404,6 +433,63 @@ class ResetsRequestState
     }
 
     /**
+     * Shared view-factory keys present when the worker served its first operation, or null before
+     * the first pass has recorded them.
+     *
+     * @var list<string>|null
+     */
+    protected static ?array $sharedViewBaseline = null;
+
+    /**
+     * Discard view data shared during the previous operation, keeping boot-time shares.
+     *
+     * Resetting System\Helpers\View::$globalVarCache alone is not enough: that static is only a
+     * memo of the view factory's real shared-data array, and the factory itself is resolved into
+     * the base container at boot, so anything a request pushed in through View::share() survives
+     * the sandbox being discarded.
+     *
+     * The factory cannot simply be emptied either — providers share legitimate data at boot (the
+     * app name, for one) that every later operation is entitled to. The first reset runs before
+     * any request code has executed, so the keys present then are exactly the boot-time set; each
+     * later reset drops whatever keys have appeared since. Values of baseline keys are left as
+     * they are: restoring snapshots of them would pin objects from the boot request for the life
+     * of the worker.
+     *
+     * @param \Illuminate\Contracts\Foundation\Application|null $base
+     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @return void
+     */
+    protected function resetSharedViewData($base, Application $sandbox): void
+    {
+        if ($base !== null && $base->resolved('view')) {
+            $factory = $base->make('view');
+        } elseif ($sandbox->resolved('view')) {
+            $factory = $sandbox->make('view');
+        } else {
+            return;
+        }
+
+        $shared = $factory->getShared();
+
+        if (static::$sharedViewBaseline === null) {
+            static::$sharedViewBaseline = array_keys($shared);
+
+            return;
+        }
+
+        $reflection = new \ReflectionObject($factory);
+
+        if (!$reflection->hasProperty('shared')) {
+            return;
+        }
+
+        $reflection->getProperty('shared')->setValue(
+            $factory,
+            array_intersect_key($shared, array_flip(static::$sharedViewBaseline))
+        );
+    }
+
+    /**
      * Roll every connection back to depth zero and discard staged transaction callbacks.
      *
      * No stock Octane listener unwinds an abandoned transaction. Leaving one open holds the
@@ -504,10 +590,17 @@ class ResetsRequestState
      * plugin that always throws makes the worker fail every request rather than quietly degrade, which
      * is what forces it to be fixed.
      *
+     * The one exception is the WorkerErrorOccurred path, where $failFast is false: that event is
+     * dispatched from inside Octane's own error handling, and a throw from here would pre-empt the
+     * listeners that report the original failure and retire the worker. There the failure is logged,
+     * the remaining plugins are still reset, and the next RequestReceived — where $failFast is true
+     * again — is what surfaces a persistently broken plugin.
+     *
+     * @param bool $failFast Throw on a failed plugin reset rather than logging it.
      * @return void
      * @throws \RuntimeException
      */
-    protected function resetPlugins(): void
+    protected function resetPlugins(bool $failFast = true): void
     {
         $pluginManager = PluginManager::instance();
 
@@ -520,11 +613,20 @@ class ResetsRequestState
                 $plugin->resetWorkerState();
             }
             catch (Throwable $ex) {
-                throw new \RuntimeException(sprintf(
-                    'Plugin %s failed to reset its worker state: %s',
+                if ($failFast) {
+                    throw new \RuntimeException(sprintf(
+                        'Plugin %s failed to reset its worker state: %s',
+                        $identifier,
+                        $ex->getMessage()
+                    ), 0, $ex);
+                }
+
+                Log::error(sprintf(
+                    'Winter.Octane: plugin %s failed to reset its worker state while the worker '
+                    . 'was already handling an error: %s',
                     $identifier,
                     $ex->getMessage()
-                ), 0, $ex);
+                ), ['exception' => $ex]);
             }
         }
     }

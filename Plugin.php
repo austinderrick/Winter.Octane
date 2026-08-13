@@ -63,27 +63,57 @@ class Plugin extends PluginBase
             return;
         }
 
+        /*
+         * The reset only works when core exposes the worker-safety primitives it calls. On a core
+         * without them, registering Octane anyway would serve traffic with no request-boundary
+         * reset — cross-user state leaks — so registration is refused outright and the reason is
+         * logged. composer.json constrains winter/storm, but the system module ships inside the
+         * application rather than as an independently versioned dependency, so the storm
+         * constraint alone cannot prove the module-side primitives exist.
+         */
+        if (!interface_exists(\Winter\Storm\Contracts\ResetsWorkerState::class)
+            || !method_exists(\Winter\Storm\Exception\ErrorHandler::class, 'resetMaskState')
+            || !method_exists(\Winter\Storm\Halcyon\Model::class, 'flushRequestCache')
+            || !method_exists(\System\Classes\MailManager::class, 'resetWorkerState')
+        ) {
+            \Illuminate\Support\Facades\Log::warning(
+                'Winter.Octane: this Winter installation predates the worker-safety primitives '
+                . 'the plugin depends on, so Octane was not registered. Update Winter and Storm '
+                . 'to a version that ships ResetsWorkerState before serving through Octane.'
+            );
+
+            return;
+        }
+
         $this->app->register(\Laravel\Octane\OctaneServiceProvider::class);
 
         /*
-         * Attach Winter's reset to the start of every operation, appended after Octane's own
-         * listeners so the new request, application and configuration have already been injected.
-         *
-         * The reset deliberately runs at the start rather than the end. An exception that escapes
-         * the HTTP kernel skips ApplicationGateway::terminate(), so RequestTerminated — and every
-         * listener registered against Octane's OperationTerminated contract — never fires. Cleaning
-         * up on the way in is the only boundary that also holds after a failed operation.
+         * The reset deliberately runs at the start of every operation rather than the end. An
+         * exception that escapes the HTTP kernel skips ApplicationGateway::terminate(), so
+         * RequestTerminated — and every listener registered against Octane's OperationTerminated
+         * contract — never fires. Cleaning up on the way in is the only boundary that also holds
+         * after a failed operation.
          *
          * WorkerErrorOccurred is included so a failed operation is cleaned up promptly rather than
          * leaving the worker dirty until the next request arrives.
+         *
+         * The listeners are attached from a booted() callback, not here. Octane attaches its own
+         * listeners — including GiveNewRequestInstanceToApplication, which installs the incoming
+         * request — in OctaneServiceProvider::boot(). Laravel fires an event's listeners in the
+         * order they were registered, so a listener attached during the register phase would run
+         * BEFORE Octane's and observe the previous operation's request. booted() runs after every
+         * provider has booted (and runs immediately when the application is already booted), which
+         * is the earliest point that is guaranteed to be after Octane's own wiring.
          */
-        foreach ([
-            \Laravel\Octane\Events\RequestReceived::class,
-            \Laravel\Octane\Events\TaskReceived::class,
-            \Laravel\Octane\Events\TickReceived::class,
-            \Laravel\Octane\Events\WorkerErrorOccurred::class,
-        ] as $event) {
-            $this->app->make('events')->listen($event, [ResetsRequestState::class, 'handle']);
-        }
+        $this->app->booted(function () {
+            foreach ([
+                \Laravel\Octane\Events\RequestReceived::class,
+                \Laravel\Octane\Events\TaskReceived::class,
+                \Laravel\Octane\Events\TickReceived::class,
+                \Laravel\Octane\Events\WorkerErrorOccurred::class,
+            ] as $event) {
+                $this->app->make('events')->listen($event, [ResetsRequestState::class, 'handle']);
+            }
+        });
     }
 }

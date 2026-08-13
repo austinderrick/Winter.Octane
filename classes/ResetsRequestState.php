@@ -51,46 +51,73 @@ class ResetsRequestState
          * On the WorkerErrorOccurred path, NOTHING here may throw. That event is dispatched from
          * Worker::handleWorkerError(), inside the catch block of Worker::handle(); an exception
          * escaping a listener there escapes the worker loop itself and kills the process with no
-         * graceful retirement. Any step can throw — an outdated module missing a reset method
-         * throws an Error, not just a misbehaving plugin — so the whole sequence is guarded, the
-         * failure is logged, and the next RequestReceived (unguarded) is what surfaces a
-         * persistent fault.
+         * graceful retirement. Each step is guarded individually — one failing step must not
+         * abandon the rest of the cleanup — and the logging itself is guarded, because a broken
+         * log channel throwing here would reopen exactly the hole this path closes. The next
+         * RequestReceived, which is unguarded, is what surfaces a persistent fault.
          */
         if ($event instanceof \Laravel\Octane\Events\WorkerErrorOccurred) {
-            try {
-                $this->reset($base, $sandbox);
-            }
-            catch (Throwable $ex) {
-                Log::error(sprintf(
-                    'Winter.Octane: the request-state reset failed while the worker was already '
-                    . 'handling an error: %s',
-                    $ex->getMessage()
-                ), ['exception' => $ex]);
+            foreach ($this->resetSteps($base, $sandbox, false) as $step) {
+                try {
+                    $step();
+                }
+                catch (Throwable $ex) {
+                    $this->logQuietly(
+                        'Winter.Octane: part of the request-state reset failed while the worker '
+                        . 'was already handling an error: ' . $ex->getMessage(),
+                        $ex
+                    );
+                }
             }
 
             return;
         }
 
-        $this->reset($base, $sandbox);
+        foreach ($this->resetSteps($base, $sandbox, true) as $step) {
+            $step();
+        }
     }
 
     /**
-     * Discard the state the previous operation produced.
+     * The steps that discard the state the previous operation produced, in order.
      *
      * @param \Illuminate\Contracts\Foundation\Application|null $base
      * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param bool $throwOnPluginFailure Whether a failed plugin reset fails the operation.
+     * @return list<callable(): void>
+     */
+    protected function resetSteps($base, Application $sandbox, bool $throwOnPluginFailure): array
+    {
+        return [
+            fn () => $this->forgetExecutionContext($base, $sandbox),
+            fn () => $this->resetCoreState(),
+            fn () => $this->resetManagers($base, $sandbox),
+            fn () => $this->resetStaticCaches(),
+            fn () => $this->resetSharedViewData($base, $sandbox),
+            fn () => $this->rollBackTransactions($base, $sandbox),
+            fn () => $this->flushRouteController($sandbox),
+            fn () => $this->resetPlugins($throwOnPluginFailure),
+        ];
+    }
+
+    /**
+     * Log an error without ever letting the logger's own failure escape.
+     *
+     * Used only on the worker-error path, where an escaping exception — including one thrown by
+     * a misconfigured log handler — would kill the worker loop outright.
+     *
+     * @param string $message
+     * @param \Throwable $ex
      * @return void
      */
-    protected function reset($base, Application $sandbox): void
+    protected function logQuietly(string $message, Throwable $ex): void
     {
-        $this->forgetExecutionContext($base, $sandbox);
-        $this->resetCoreState();
-        $this->resetManagers($base, $sandbox);
-        $this->resetStaticCaches();
-        $this->resetSharedViewData($base, $sandbox);
-        $this->rollBackTransactions($base, $sandbox);
-        $this->flushRouteController($sandbox);
-        $this->resetPlugins();
+        try {
+            Log::error($message, ['exception' => $ex]);
+        }
+        catch (Throwable $logFailure) {
+            // The log channel itself is broken; there is nowhere safe left to report to.
+        }
     }
 
     /**
@@ -267,6 +294,11 @@ class ResetsRequestState
         // its own, but under PHP-FPM the cache lived for one request; per-worker it would grow
         // without bound and serve values gone stale in the database indefinitely.
         \Winter\Storm\Auth\Models\Preferences::class => ['cache' => []],
+
+        // The backend subclass REDECLARES the static, so it owns a separate storage slot that
+        // late static binding routes the inherited methods to; resetting the parent above does
+        // not touch it.
+        \Backend\Models\UserPreference::class => ['cache' => []],
     ];
 
     /**
@@ -478,10 +510,14 @@ class ResetsRequestState
      *
      * The factory cannot simply be emptied either — providers share legitimate data at boot (the
      * app name, for one) that every later operation is entitled to. The first reset runs before
-     * any request code has executed, so the entries present then are exactly the boot-time set,
-     * and each later reset restores that snapshot wholesale. Restoring values, not just dropping
-     * added keys, matters: a request that OVERWRITES a boot-time key (a per-site app name, say)
-     * would otherwise hand its value to every later request on the worker.
+     * any request code has executed AND before Octane's own listeners fire (this listener is
+     * attached at a higher priority), so the entries present then are exactly the boot-time set —
+     * not yet polluted by the per-operation objects Octane injects, such as the request sandbox
+     * that GiveNewApplicationInstanceToViewFactory writes into shared['app']. Each later reset
+     * restores that snapshot wholesale, and Octane's listeners then re-inject the CURRENT
+     * operation's objects on top, so nothing dead is ever served. Restoring values, not just
+     * dropping added keys, matters: a request that OVERWRITES a boot-time key (a per-site app
+     * name, say) would otherwise hand its value to every later request on the worker.
      *
      * The consequence is that a share made during a request lives exactly as long as under
      * PHP-FPM: one operation. A provider first booted mid-request that shares data once must
@@ -618,14 +654,17 @@ class ResetsRequestState
      * plugin that always throws makes the worker fail every request rather than quietly degrade, which
      * is what forces it to be fixed.
      *
-     * The WorkerErrorOccurred path is the one place this throw does not propagate: handle() wraps
-     * the entire reset sequence there, because that event is dispatched from inside the worker
-     * loop's catch block, where an escaping exception kills the process outright.
+     * The WorkerErrorOccurred path is the one place this throw does not propagate: there
+     * $throwOnFailure is false, a failed plugin is logged, and the REMAINING plugins are still
+     * reset — that event is dispatched from inside the worker loop's catch block, where an
+     * escaping exception kills the process outright, and one broken plugin abandoning every
+     * other plugin's cleanup would leave exactly the cross-user state this class exists to clear.
      *
+     * @param bool $throwOnFailure Whether a failed plugin reset fails the operation.
      * @return void
      * @throws \RuntimeException
      */
-    protected function resetPlugins(): void
+    protected function resetPlugins(bool $throwOnFailure = true): void
     {
         $pluginManager = PluginManager::instance();
 
@@ -638,11 +677,20 @@ class ResetsRequestState
                 $plugin->resetWorkerState();
             }
             catch (Throwable $ex) {
-                throw new \RuntimeException(sprintf(
-                    'Plugin %s failed to reset its worker state: %s',
+                if ($throwOnFailure) {
+                    throw new \RuntimeException(sprintf(
+                        'Plugin %s failed to reset its worker state: %s',
+                        $identifier,
+                        $ex->getMessage()
+                    ), 0, $ex);
+                }
+
+                $this->logQuietly(sprintf(
+                    'Winter.Octane: plugin %s failed to reset its worker state while the worker '
+                    . 'was already handling an error: %s',
                     $identifier,
                     $ex->getMessage()
-                ), 0, $ex);
+                ), $ex);
             }
         }
     }

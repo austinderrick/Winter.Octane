@@ -93,6 +93,108 @@ class RequestStateResetTest extends PersistentWorkerTestCase
     }
 
     /**
+     * The reset must run no matter what other listeners do.
+     *
+     * The dispatcher stops propagation when a listener returns false, but Octane's
+     * ApplicationGateway ignores that return value and proceeds into the kernel anyway — so a
+     * reset listener that ran later in the chain could be silently skipped for an operation that
+     * is still served. The reset is therefore attached at the highest priority, ahead of anything
+     * attached at a normal one.
+     */
+    public function testTheResetCannotBeSkippedByAHaltingListener()
+    {
+        $app = $this->bootWorker();
+
+        $this->addWorkerRoute('_worker/unskippable', fn () => 'ok');
+
+        /*
+         * Priority 1000 sorts ahead of every default-priority listener (Octane's included), so if
+         * the reset were attached at default priority, this halts the chain before it.
+         */
+        $app['events']->listen(
+            \Laravel\Octane\Events\RequestReceived::class,
+            fn () => false,
+            1000
+        );
+
+        $probe = new class ($app) extends \System\Classes\PluginBase
+        {
+            /**
+             * @var int Number of times the reset reached this plugin.
+             */
+            public $resets = 0;
+
+            /**
+             * @return void
+             */
+            public function resetWorkerState(): void
+            {
+                $this->resets++;
+            }
+        };
+
+        $this->withFakePlugins(
+            ['Winter.Tests.SkipProbe' => $probe],
+            fn () => $this->dispatchWorkerRequests(Request::create('/_worker/unskippable', 'GET')),
+            keepExisting: true
+        );
+
+        $this->assertSame(
+            1,
+            $probe->resets,
+            'A listener returning false must not be able to skip the request-boundary reset.'
+        );
+    }
+
+    /**
+     * Octane's own listeners must observe already-cleaned state, and the per-operation objects
+     * they inject must survive the reset.
+     *
+     * The second half is the regression that matters: the reset restores the view factory's
+     * boot-time shared data, and Octane's GiveNewApplicationInstanceToViewFactory injects the
+     * CURRENT sandbox into shared['app'] on every operation. If the reset ran after Octane's
+     * listeners, its baseline would capture the first operation's sandbox — a dead object once
+     * that operation's sandbox is flushed — and replay it into every later render.
+     */
+    public function testViewSharesResetToBootStateAndOctaneReinjectsLiveObjects()
+    {
+        $this->bootWorker();
+
+        $observed = [];
+
+        $this->addWorkerRoute('_worker/share-set', function () {
+            \Illuminate\Support\Facades\View::share('leakedShare', 'from-request-one');
+
+            return 'shared';
+        });
+
+        $this->addWorkerRoute('_worker/share-read', function () use (&$observed) {
+            $shared = app('view')->getShared();
+
+            $observed['leakPresent'] = array_key_exists('leakedShare', $shared);
+            $observed['appIsCurrentSandbox'] =
+                ($shared['app'] ?? null) === \Illuminate\Container\Container::getInstance();
+
+            return 'read';
+        });
+
+        $this->dispatchWorkerRequests(
+            Request::create('/_worker/share-set', 'GET'),
+            Request::create('/_worker/share-read', 'GET')
+        );
+
+        $this->assertFalse(
+            $observed['leakPresent'],
+            'view data shared during one request must not be visible to the next'
+        );
+        $this->assertTrue(
+            $observed['appIsCurrentSandbox'],
+            'shared["app"] must be the CURRENT operation\'s sandbox — a stale instance here means '
+            . 'the reset ran after Octane\'s listeners and snapshotted a dead application object'
+        );
+    }
+
+    /**
      * The auth manager is resolved into the base container at boot, so the sandbox never discards
      * it and a resolved user would otherwise be visible to the next request.
      */

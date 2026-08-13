@@ -115,23 +115,31 @@ class Plugin extends PluginBase
          * WorkerErrorOccurred is included so a failed operation is cleaned up promptly rather than
          * leaving the worker dirty until the next request arrives.
          *
-         * The listeners are attached from a booted() callback, not here. Octane attaches its own
-         * listeners — including GiveNewRequestInstanceToApplication, which installs the incoming
-         * request — in OctaneServiceProvider::boot(). Laravel fires an event's listeners in the
-         * order they were registered, so a listener attached during the register phase would run
-         * BEFORE Octane's and observe the previous operation's request. booted() runs after every
-         * provider has booted (and runs immediately when the application is already booted), which
-         * is the earliest point that is guaranteed to be after Octane's own wiring.
+         * The listeners are attached at the highest priority Storm's dispatcher accepts, so the
+         * reset runs FIRST — before Octane's own listeners (attached at default priority in
+         * OctaneServiceProvider::boot()) and before anything a third party registers. Three
+         * properties depend on this, and a test pins each:
+         *
+         *  - The reset cannot be skipped. The dispatcher stops propagation when a listener
+         *    returns false, and Octane's ApplicationGateway proceeds into the kernel regardless,
+         *    so a reset attached later could be silently bypassed for an operation.
+         *  - Every other listener starts from a clean slate rather than observing the previous
+         *    operation's state.
+         *  - The view-share baseline is captured before Octane injects per-operation objects
+         *    (the sandbox, via GiveNewApplicationInstanceToViewFactory) into shared data, and is
+         *    restored before Octane re-injects them for the current operation.
+         *
+         * Running first is safe because the reset reads NOTHING from the incoming request: it
+         * only discards previous state. Anything request-derived — the auth manager's throttle
+         * address above all — is resolved lazily, after the middleware that makes it trustworthy.
          */
-        $this->app->booted(function () {
-            foreach ([
-                \Laravel\Octane\Events\RequestReceived::class,
-                \Laravel\Octane\Events\TaskReceived::class,
-                \Laravel\Octane\Events\TickReceived::class,
-                \Laravel\Octane\Events\WorkerErrorOccurred::class,
-            ] as $event) {
-                $this->app->make('events')->listen($event, [ResetsRequestState::class, 'handle']);
-            }
-        });
+        foreach ([
+            \Laravel\Octane\Events\RequestReceived::class,
+            \Laravel\Octane\Events\TaskReceived::class,
+            \Laravel\Octane\Events\TickReceived::class,
+            \Laravel\Octane\Events\WorkerErrorOccurred::class,
+        ] as $event) {
+            $this->app->make('events')->listen($event, [ResetsRequestState::class, 'handle'], PHP_INT_MAX);
+        }
     }
 }

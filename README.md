@@ -2,35 +2,21 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/austinderrick/Winter.Octane/blob/main/LICENSE)
 
-Serves Winter CMS from a persistent application server via [Laravel Octane](https://laravel.com/docs/octane).
+Run Winter CMS on [Laravel Octane](https://laravel.com/docs/octane) with FrankenPHP, Swoole, or RoadRunner.
 
-Under PHP-FPM every request gets a fresh process, so leftover state is harmless. Under Octane one booted application serves many requests in a row. Anything derived from one request can leak into the next, including another user's data. This plugin exists to stop that.
+PHP normally throws everything away when a request ends. Octane doesn't. One booted copy of Winter serves request after request, which is where the speed comes from. The catch: whatever the last request left in memory is still sitting there when the next one arrives. Without cleanup, one user can end up seeing menus, settings, or preferences that belong to someone else.
 
-Supports:
+This plugin is that cleanup. It:
 
-- FrankenPHP, Swoole and RoadRunner
-- Automatic registration of Octane's service provider (Winter turns off Laravel package discovery)
-- A request-boundary reset that clears state left behind by the previous request
-- A reset hook for plugins that cache their own per-request data
-
-## What the reset clears
-
-The reset runs at the start of every Octane operation. It discards:
-
-- The resolved execution context (back-end vs. front-end)
-- The authenticated back-end user
-- Error-handler masks
-- Per-request static caches in core classes
-- Abandoned database transactions and staged transaction callbacks
-- Per-request state in any plugin that opts in
-
-It runs at the start of an operation, not the end, on purpose. An exception that escapes the HTTP kernel skips Octane's terminate step. Cleanup on the way in still holds after a failed operation.
+- Registers Octane with Winter (Winter turns off Laravel's package discovery, so an installed `laravel/octane` does nothing on its own)
+- Wipes what the last request left behind before each new one: the logged-in user, back-end vs. front-end detection, cached menus and settings, view data, abandoned database transactions
+- Gives your own plugins a hook to wipe their leftovers too
 
 ## Requirements
 
-- Winter CMS with the worker-safety primitives. Today that means the `feat/octane-worker-support` branches of `wintercms/winter` and `wintercms/storm`.
+- Winter CMS with the worker-safety changes (right now that means the `feat/octane-worker-support` branches of `wintercms/winter` and `wintercms/storm`)
 - PHP 8.1 or later
-- One of Octane's supported servers: FrankenPHP, Swoole or RoadRunner
+- FrankenPHP, Swoole, or RoadRunner
 
 ## Installation
 
@@ -53,17 +39,17 @@ Then start a worker:
 php artisan octane:start
 ```
 
-Octane's own documentation covers server choice, deployment and tuning. None of it is Winter-specific.
+Octane's own docs cover picking a server, deployment, and tuning. None of it is Winter-specific.
 
-## Do not disable this plugin while Octane is serving
+## Don't disable this plugin while Octane is serving
 
-A disabled plugin never registers, so disabling this one detaches the request-boundary reset. Workers then leak state across requests, including the authenticated user. To stop using Octane, switch the site back to PHP-FPM first. Once no worker is dispatching events, the plugin is inert and safe to disable or remove.
+A disabled plugin never loads, so its cleanup never runs. Your workers keep serving anyway, and requests quietly start leaking state between users, including who's logged in. If you want off Octane, point the site back at PHP-FPM first. Once no worker is running, the plugin does nothing and you can disable or remove it safely.
 
-The plugin marks itself `elevated`. Winter skips normal plugin setup on privileged routes and commands, and the flag keeps this plugin registered there. Without it, the first request a worker served could decide that the reset never attaches at all.
+The plugin also marks itself `elevated`, so Winter loads it even on the few routes and commands where normal plugins get skipped. Without that, a worker could boot on one of those and run without cleanup until someone restarts it.
 
 ## For plugin authors
 
-Does your plugin cache request-derived data on the plugin object, a singleton or a static property? Add a reset, or a worker can serve one user's data to another:
+Does your plugin keep per-request data on the plugin object, a singleton, or a static property? Under Octane that data survives into the next request, and the next request might belong to a different user. Give your plugin a way to drop it:
 
 ```php
 public function resetWorkerState(): void
@@ -72,13 +58,17 @@ public function resetWorkerState(): void
 }
 ```
 
-Two rules keep a reset safe. First, make it idempotent: it can run twice in one operation, including after an operation that threw partway through. Second, never unregister boot-time extensions. Things like registration callbacks, aliases, menu definitions and event listeners are built once per worker. Discard them and the worker stays broken until it restarts. Clear only what a request produced.
+The cleanup runs before every request. Two things to keep in mind:
 
-You can also declare `implements \Winter\Storm\Contracts\ResetsWorkerState` for a compile-time guarantee. The bare method is the safer choice for plugins that support older Winter versions. PHP resolves `implements` when it loads a class, so naming a contract that an older Storm does not ship stops the plugin from loading at all.
+- It can run more than once for the same request, for example after a request that crashed halfway through. Write it so running it twice is harmless.
+- Only clear what a request created. Event listeners, menu items, aliases, and anything else you registered at boot are built once per worker. Throw those away and they stay gone until the worker restarts.
+- Don't read the current request in here. The cleanup runs before the request is fully set up, and its job is to forget the old one, not to look at the new one.
+
+You can also write `implements \Winter\Storm\Contracts\ResetsWorkerState` if your plugin only supports Winter versions that have the contract. For anything older, stick with the plain method: PHP refuses to load a class that names an interface it can't find, so the `implements` version won't load at all on an older install.
 
 ## Tests
 
-The suite boots one application and dispatches real requests through Octane's `ApplicationGateway`. A leak in a test is the same leak a worker would show in production. Run it from the plugin directory inside a Winter installation:
+The tests boot one copy of Winter and push real requests through Octane's gateway, the same way a worker does. If state leaks between two requests in a test, it leaks in production. Run them from the plugin directory inside a Winter installation:
 
 ```bash
 ../../../vendor/bin/phpunit

@@ -85,33 +85,48 @@ class ProductionBootOrderTest extends PersistentWorkerTestCase
     }
 
     /**
-     * The reset must observe the operation it is resetting FOR, not the one before it.
+     * The reset must run before every other listener, in the order production attaches them.
      *
-     * Octane installs the incoming request into the sandbox from a RequestReceived listener, and
-     * listeners fire in registration order. Storm's dispatcher wraps every listener in a closure
-     * when it is attached, so the order cannot be asserted structurally; instead a probe plugin
-     * records which request is bound at the moment its reset runs.
+     * The reset is attached at the highest priority, and two properties hang on that: a listener
+     * returning false cannot skip it, and Octane's own listeners observe already-cleaned state.
+     * Storm's dispatcher wraps every listener in a closure when it is attached, so the order
+     * cannot be asserted structurally; instead a probe plugin records when the reset ran and a
+     * default-priority marker listener records when the rest of the chain started.
      */
-    public function testTheResetObservesTheIncomingRequestNotThePreviousOne()
+    public function testTheResetRunsFirstUnderProductionRegistrationOrder()
     {
         $app = $this->bootWorker();
 
         $this->addWorkerRoute('_worker/order', fn () => 'ok');
 
+        $order = [];
+
+        $app['events']->listen(
+            \Laravel\Octane\Events\RequestReceived::class,
+            function () use (&$order) {
+                $order[] = 'default-priority-listener';
+            }
+        );
+
         $probe = new class ($app) extends \System\Classes\PluginBase
         {
             /**
-             * @var array Paths of the bound request at each reset, in order.
+             * @var callable|null Called when the reset reaches this plugin.
              */
-            public $seenPaths = [];
+            public $onReset = null;
 
             /**
              * @return void
              */
             public function resetWorkerState(): void
             {
-                $this->seenPaths[] = app('request')->path();
+                if ($this->onReset !== null) {
+                    ($this->onReset)();
+                }
             }
+        };
+        $probe->onReset = function () use (&$order) {
+            $order[] = 'reset';
         };
 
         $this->withFakePlugins(
@@ -121,11 +136,11 @@ class ProductionBootOrderTest extends PersistentWorkerTestCase
         );
 
         $this->assertSame(
-            ['_worker/order'],
-            $probe->seenPaths,
-            'The reset ran against the previous operation\'s request. It must be attached after '
-            . 'Octane\'s GiveNewRequestInstanceToApplication, or everything request-derived it '
-            . 'touches — the auth throttle IP above all — belongs to the wrong operation.'
+            ['reset', 'default-priority-listener'],
+            $order,
+            'The reset must run ahead of every default-priority listener. Running later means a '
+            . 'false-returning listener can skip it entirely, and other listeners observe the '
+            . 'previous operation\'s state.'
         );
     }
 }

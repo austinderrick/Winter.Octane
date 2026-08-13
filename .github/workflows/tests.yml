@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+    name: PHP ${{ matrix.php }}
+    steps:
+      - name: Checkout Winter (octane branch)
+        uses: actions/checkout@v4
+        with:
+          repository: austinderrick/winter
+          ref: feat/octane-worker-support
+          path: winter
+
+      - name: Checkout Storm (octane branch)
+        uses: actions/checkout@v4
+        with:
+          repository: austinderrick/storm
+          ref: feat/octane-worker-support
+          path: storm
+
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: winter/plugins/winter/octane
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, intl, gd, xml, zip, pdo_sqlite, sqlite3
+          coverage: none
+
+      - name: Install dependencies
+        working-directory: winter
+        run: composer install --no-interaction --no-progress
+
+      # composer/installers places the module packages into modules/, which clobbers the branch's
+      # own module changes checked out above. Reassert the branch content, then point the storm
+      # package at the branch checkout the same way the development environment does (a symlink in
+      # place of the packaged copy).
+      - name: Use the branch modules and storm
+        working-directory: winter
+        run: |
+          git checkout -- modules
+          rm -rf vendor/winter/storm
+          ln -s "$GITHUB_WORKSPACE/storm" vendor/winter/storm
+
+      - name: Prepare application
+        working-directory: winter
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          touch storage/database.sqlite
+          sed -i 's/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/' .env
+          sed -i 's|^DB_DATABASE=.*|DB_DATABASE=storage/database.sqlite|' .env
+          php artisan winter:up
+
+      - name: Run plugin tests (in-process worker)
+        working-directory: winter/plugins/winter/octane
+        run: ../../../vendor/bin/phpunit
+
+      - name: Run end-to-end smoke test (real FrankenPHP server)
+        working-directory: winter/plugins/winter/octane
+        env:
+          WINTER_OCTANE_E2E: '1'
+        run: ../../../vendor/bin/phpunit --group e2e

@@ -2,34 +2,28 @@
 
 namespace Winter\Octane\Tests;
 
-use Illuminate\Container\Container;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Facade;
-use Laravel\Octane\ApplicationGateway;
-use Laravel\Octane\CurrentApplication;
-use Laravel\Octane\Events\WorkerErrorOccurred;
 use Symfony\Component\HttpFoundation\Response;
 use System\Tests\Bootstrap\PluginTestCase;
 use Throwable;
 
 /**
- * Dispatches several requests through one application instance.
+ * Dispatches several requests through one application instance, using Octane's real Worker.
  *
  * Winter's ordinary test cases build a fresh application for every test method, which is the exact
  * opposite of how a persistent application server behaves and means no conventional test can
- * observe state crossing a request boundary. This base class boots once and then drives Octane's
- * real ApplicationGateway per request, mirroring what Laravel\Octane\Worker::handle() does:
+ * observe state crossing a request boundary. This base class boots Laravel\Octane\Worker once and
+ * hands every request to Worker::handle(), so the sandbox cloning, event order, output buffering,
+ * error handling and post-request restoration are Octane's own code rather than a reimplementation
+ * of it. The one substitution is the application factory: the worker is given the application this
+ * test case has already prepared (migrations run, plugin registered) instead of bootstrapping a
+ * second one.
  *
- *   - clone the application to form the request sandbox
- *   - point the container instance and facade root at that clone
- *   - dispatch through the gateway, then terminate it
- *   - dispatch WorkerErrorOccurred if the operation threw, as the worker does
- *   - flush the sandbox and restore the base application
- *
- * The gateway is used rather than a hand-written approximation so the assertions exercise Octane's
- * own event order, including the case where an exception escapes the HTTP kernel and
- * RequestTerminated is therefore never dispatched.
+ * Responses and errors are collected from the worker's client, which is where a real server would
+ * receive them. An exception that escapes the HTTP kernel therefore reaches the tests the same way
+ * it reaches production: through Client::error() and the WorkerErrorOccurred event, with
+ * RequestTerminated never dispatched.
  *
  * Extends PluginTestCase so the Winter.Octane plugin is registered into the application under
  * test: the request-boundary reset these tests observe is attached by the plugin's register(),
@@ -43,6 +37,20 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
      * The base application every request sandbox is cloned from.
      */
     protected ?Application $workerApplication = null;
+
+    /**
+     * The real Octane worker driving the dispatches, once booted.
+     *
+     * @var \Laravel\Octane\Worker|null
+     */
+    protected $worker = null;
+
+    /**
+     * The recording client handed to the worker.
+     *
+     * @var \Laravel\Octane\Contracts\Client|null
+     */
+    protected $workerClient = null;
 
     /**
      * Responses and exceptions from the most recent dispatchWorkerRequests() call, in order.
@@ -106,6 +114,8 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
         unset($_ENV['APP_RUNNING_IN_CONSOLE']);
 
         $this->workerApplication = null;
+        $this->worker = null;
+        $this->workerClient = null;
         $this->workerResults = [];
 
         parent::tearDown();
@@ -148,7 +158,7 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
     }
 
     /**
-     * A no-op Octane client.
+     * A recording Octane client: responses and errors land here, as they would on a real server.
      *
      * Built here rather than declared at the bottom of this file on purpose. `implements` is resolved
      * when the class is loaded, so a file-scope class naming an Octane contract would make this file
@@ -161,6 +171,16 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
     {
         return new class implements \Laravel\Octane\Contracts\Client
         {
+            /**
+             * @var array<int, \Laravel\Octane\OctaneResponse>
+             */
+            public array $responses = [];
+
+            /**
+             * @var array<int, \Throwable>
+             */
+            public array $errors = [];
+
             public function marshalRequest(\Laravel\Octane\RequestContext $context): array
             {
                 return [$context->data['request'] ?? Request::capture(), $context];
@@ -168,18 +188,25 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
 
             public function respond(\Laravel\Octane\RequestContext $context, \Laravel\Octane\OctaneResponse $response): void
             {
-                //
+                $this->responses[] = $response;
             }
 
             public function error(Throwable $e, Application $app, Request $request, \Laravel\Octane\RequestContext $context): void
             {
-                //
+                $this->errors[] = $e;
             }
         };
     }
 
     /**
-     * Boot the worker once, pre-resolving whatever Octane would warm.
+     * Boot the real Octane worker once, against the application this test case prepared.
+     *
+     * Worker::boot() normally builds the application through ApplicationFactory, but a second
+     * bootstrap would discard the migrations and test state already set up on $this->app. The
+     * factory is therefore overridden at exactly one point: createApplication() applies the
+     * worker's initial instances (the client binding among them) to the prepared application and
+     * warms it, instead of constructing a new one. Everything after that — WorkerStarting,
+     * sandboxing, event dispatch, error handling — is Octane's own code.
      */
     protected function bootWorker(): Application
     {
@@ -187,63 +214,70 @@ abstract class PersistentWorkerTestCase extends PluginTestCase
             return $this->workerApplication;
         }
 
-        /*
-         * A real worker binds its client into the base container, and several stock Octane
-         * listeners resolve it — StopWorkerIfNecessary does so while handling WorkerErrorOccurred.
-         * Binding a no-op client keeps those listeners on their production code path.
-         */
-        $this->app->instance(\Laravel\Octane\Contracts\Client::class, $this->makeWorkerClient());
+        $this->workerClient = $this->makeWorkerClient();
 
-        foreach ((array) $this->app['config']->get('octane.warm', []) as $service) {
-            if (is_string($service) && $this->app->bound($service)) {
-                $this->app->make($service);
+        $factory = new class ($this->app) extends \Laravel\Octane\ApplicationFactory
+        {
+            public function __construct(protected Application $prepared)
+            {
+                parent::__construct($prepared->basePath());
             }
-        }
+
+            public function createApplication(array $initialInstances = []): Application
+            {
+                foreach ($initialInstances as $key => $value) {
+                    $this->prepared->instance($key, $value);
+                }
+
+                return $this->warm($this->prepared);
+            }
+        };
+
+        $this->worker = new \Laravel\Octane\Worker($factory, $this->workerClient);
+        $this->worker->boot();
 
         return $this->workerApplication = $this->app;
     }
 
     /**
-     * Dispatch requests through the worker, one sandbox each.
+     * Dispatch requests through the real worker, one sandbox each.
+     *
+     * Each result is what the client received for that request: the response, or the throwable
+     * Octane routed to Client::error() when the operation failed before responding.
      *
      * @param \Illuminate\Http\Request ...$requests
      * @return array<int, \Symfony\Component\HttpFoundation\Response|\Throwable>
      */
     protected function dispatchWorkerRequests(Request ...$requests): array
     {
-        $worker = $this->bootWorker();
+        $this->bootWorker();
         $this->workerResults = [];
 
         foreach ($requests as $request) {
-            CurrentApplication::set($sandbox = clone $worker);
-            Container::setInstance($sandbox);
-            Facade::clearResolvedInstances();
-            Facade::setFacadeApplication($sandbox);
+            $errorsBefore = count($this->workerClient->errors);
+            $responsesBefore = count($this->workerClient->responses);
 
-            $gateway = new ApplicationGateway($worker, $sandbox);
+            /*
+             * Worker::handle() opens an output buffer and, on the error path, leaves it open; a
+             * real server loop absorbs that, PHPUnit reports it as a leaked buffer. Restore the
+             * level the test started with.
+             */
+            $bufferLevel = ob_get_level();
 
-            try {
-                $response = $gateway->handle($request);
-                $this->workerResults[] = $response;
-                $gateway->terminate($request, $response);
+            $this->worker->handle($request, new \Laravel\Octane\RequestContext([]));
+
+            while (ob_get_level() > $bufferLevel) {
+                ob_end_clean();
             }
-            catch (Throwable $exception) {
-                /*
-                 * Worker::handle() catches before reaching terminate(), so RequestTerminated is not
-                 * dispatched on this path. Only WorkerErrorOccurred is.
-                 */
-                $sandbox['events']->dispatch(new WorkerErrorOccurred($exception, $sandbox));
-                $this->workerResults[] = $exception;
-            }
-            finally {
-                $sandbox->flush();
 
-                CurrentApplication::set($worker);
-                Container::setInstance($worker);
-                Facade::clearResolvedInstances();
-                Facade::setFacadeApplication($worker);
-
-                unset($gateway, $sandbox);
+            if (count($this->workerClient->errors) > $errorsBefore) {
+                $this->workerResults[] = end($this->workerClient->errors);
+            } elseif (count($this->workerClient->responses) > $responsesBefore) {
+                $this->workerResults[] = end($this->workerClient->responses)->response;
+            } else {
+                $this->workerResults[] = new \RuntimeException(
+                    'The worker produced neither a response nor an error for ' . $request->path()
+                );
             }
         }
 

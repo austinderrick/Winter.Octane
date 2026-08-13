@@ -1,5 +1,6 @@
 # Octane Plugin
 
+[![Tests](https://github.com/austinderrick/Winter.Octane/actions/workflows/tests.yml/badge.svg)](https://github.com/austinderrick/Winter.Octane/actions/workflows/tests.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/austinderrick/Winter.Octane/blob/main/LICENSE)
 
 Adds [Laravel Octane](https://laravel.com/docs/octane) support to Winter CMS, so a site can be served by a persistent application server (FrankenPHP, Swoole or RoadRunner) instead of PHP-FPM.
@@ -40,6 +41,21 @@ php artisan octane:start
 ```
 
 Refer to the [Octane documentation](https://laravel.com/docs/octane) for server configuration, deployment and tuning.
+
+### FrankenPHP and Winter's public path
+
+Winter serves from the project root by default, but the `frankenphp-worker.php` file Octane generates assumes a `public/` directory one level below the project. If the worker fails to start with `worker frankenphp-worker.php has not reached frankenphp_handle_request()`, replace the generated file in your project root with:
+
+```php
+<?php
+
+$_SERVER['APP_BASE_PATH'] = $_ENV['APP_BASE_PATH'] ?? $_SERVER['APP_BASE_PATH'] ?? __DIR__;
+$_SERVER['APP_PUBLIC_PATH'] = $_ENV['APP_PUBLIC_PATH'] ?? $_SERVER['APP_PUBLIC_PATH'] ?? __DIR__;
+
+require $_SERVER['APP_BASE_PATH'].'/vendor/laravel/octane/bin/frankenphp-worker.php';
+```
+
+Octane only generates the file when it is missing, so the replacement persists. Sites [using a public folder](https://wintercms.com/docs/develop/docs/setup/configuration#using-a-public-folder) are not affected.
 
 ## Disabling the plugin
 

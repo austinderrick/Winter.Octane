@@ -172,11 +172,14 @@ class FrankenPhpSmokeTest extends TestCase
                 );
             }
 
-            $socket = @fsockopen('127.0.0.1', $this->port, $errorCode, $errorMessage, 1);
+            /*
+             * A TCP accept only proves the server process is listening; the worker behind it can
+             * still be booting, and a request in that window gets an error response. Readiness is
+             * an actual 200 from the health of the diagnostic route.
+             */
+            [$httpStatus] = $this->fetch('/_octane-smoke/read');
 
-            if ($socket !== false) {
-                fclose($socket);
-
+            if ($httpStatus === 200) {
                 return;
             }
 
@@ -220,16 +223,17 @@ class FrankenPhpSmokeTest extends TestCase
      */
     protected function get(string $path): array
     {
-        $context = stream_context_create(['http' => ['timeout' => 10]]);
-        $body = @file_get_contents('http://127.0.0.1:' . $this->port . $path, false, $context);
+        [$status, $body] = $this->fetch($path);
 
-        $this->assertNotFalse($body, sprintf(
-            "GET %s failed. Server log tail:\n%s",
+        $this->assertSame(200, $status, sprintf(
+            "GET %s answered %s. Body:\n%s\nServer log tail:\n%s",
             $path,
+            $status === null ? 'nothing (connection failed)' : "HTTP $status",
+            substr((string) $body, 0, 500),
             $this->logTail()
         ));
 
-        $decoded = json_decode($body, true);
+        $decoded = json_decode((string) $body, true);
 
         $this->assertIsArray($decoded, sprintf(
             "GET %s did not return JSON. Body:\n%s",
@@ -272,6 +276,28 @@ $_SERVER['APP_PUBLIC_PATH'] = $_ENV['APP_PUBLIC_PATH'] ?? $_SERVER['APP_PUBLIC_P
 require $_SERVER['APP_BASE_PATH'].'/vendor/laravel/octane/bin/frankenphp-worker.php';
 
 PHP);
+    }
+
+    /**
+     * Fetch a path, tolerating error statuses.
+     *
+     * @param string $path
+     * @return array{0: int|null, 1: string|false} HTTP status (null when no response) and body.
+     */
+    protected function fetch(string $path): array
+    {
+        $context = stream_context_create(['http' => ['timeout' => 10, 'ignore_errors' => true]]);
+        $body = @file_get_contents('http://127.0.0.1:' . $this->port . $path, false, $context);
+
+        $status = null;
+
+        foreach ($http_response_header ?? [] as $header) {
+            if (preg_match('#^HTTP/\S+\s(\d{3})#', $header, $matches)) {
+                $status = (int) $matches[1];
+            }
+        }
+
+        return [$status, $body];
     }
 
     /**

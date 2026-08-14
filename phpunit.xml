@@ -6,6 +6,10 @@
     <testsuites>
         <testsuite name="Octane">
             <directory>./tests</directory>
+            <exclude>./tests/E2e</exclude>
+        </testsuite>
+        <testsuite name="E2e">
+            <directory>./tests/E2e</directory>
         </testsuite>
     </testsuites>
     <php>

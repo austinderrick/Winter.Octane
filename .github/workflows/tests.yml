@@ -15,21 +15,21 @@ jobs:
     name: PHP ${{ matrix.php }}
     steps:
       - name: Checkout Winter (octane branch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: austinderrick/winter
           ref: feat/octane-worker-support
           path: winter
 
       - name: Checkout Storm (octane branch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: austinderrick/storm
           ref: feat/octane-worker-support
           path: storm
 
       - name: Checkout plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: winter/plugins/winter/octane
 

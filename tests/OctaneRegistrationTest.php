@@ -64,5 +64,4 @@ class OctaneRegistrationTest extends PluginTestCase
     {
         $this->assertIsArray($this->app['config']->get('octane.listeners'));
     }
-
 }

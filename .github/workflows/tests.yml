@@ -65,6 +65,18 @@ jobs:
           sed -i 's|^DB_DATABASE=.*|DB_DATABASE=storage/database.sqlite|' .env
           php artisan winter:up
 
+      - name: Lint
+        working-directory: winter/plugins/winter/octane
+        run: |
+          ../../../vendor/bin/parallel-lint Plugin.php routes.php classes tests
+          ../../../vendor/bin/phpcs --standard=phpcs.xml.dist
+
+      - name: Static analysis
+        working-directory: winter/plugins/winter/octane
+        run: |
+          wget -q -O phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          php phpstan.phar analyse -c phpstan.neon.dist --no-progress
+
       - name: Run plugin tests (in-process worker)
         working-directory: winter/plugins/winter/octane
         run: ../../../vendor/bin/phpunit

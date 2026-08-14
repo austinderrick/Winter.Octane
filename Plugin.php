@@ -75,7 +75,9 @@ class Plugin extends PluginBase
          * method means a version mismatch.
          */
         $missing = !interface_exists(\Winter\Storm\Contracts\ResetsWorkerState::class)
+            // @phpstan-ignore function.alreadyNarrowedType (probes for OLDER cores; always true when analysed against this one)
             || !method_exists(\Winter\Storm\Exception\ErrorHandler::class, 'resetMaskState')
+            // @phpstan-ignore function.alreadyNarrowedType (same version-skew probe)
             || !method_exists(\Winter\Storm\Halcyon\Model::class, 'flushRequestCache');
 
         foreach ([

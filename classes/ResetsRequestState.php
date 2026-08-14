@@ -1,6 +1,6 @@
 <?php namespace Winter\Octane\Classes;
 
-use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Foundation\Application;
 use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Support\Facades\Log;
 use System\Classes\PluginManager;
@@ -81,8 +81,8 @@ class ResetsRequestState
     /**
      * The steps that discard the state the previous operation produced, in order.
      *
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @param bool $throwOnPluginFailure Whether a failed plugin reset fails the operation.
      * @return list<callable(): void>
      */
@@ -129,8 +129,8 @@ class ResetsRequestState
      * from the CLI, so the value resolved during boot comes from the synthetic console request and
      * lives on the base container that every sandbox is cloned from.
      *
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return void
      */
     protected function forgetExecutionContext($base, Application $sandbox): void
@@ -180,8 +180,8 @@ class ResetsRequestState
      * boundary — including ones this install never uses. A manager that was never resolved holds no
      * state to discard, so skipping it is also the correct result and not merely the cheaper one.
      *
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return void
      */
     protected function resetManagers($base, Application $sandbox): void
@@ -225,8 +225,8 @@ class ResetsRequestState
      * is a shallow clone: a manager first resolved inside the current operation appears there.
      *
      * @param class-string $manager
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return bool
      */
     protected function isResolved(string $manager, $base, Application $sandbox): bool
@@ -524,8 +524,8 @@ class ResetsRequestState
      * share per request instead (or use a view composer) to work on a worker; a boundary reset
      * cannot tell that share apart from request state, and keeping it would keep the leaks too.
      *
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return void
      */
     protected function resetSharedViewData($base, Application $sandbox): void
@@ -561,8 +561,8 @@ class ResetsRequestState
      * the services Octane pre-warms into the base container, its staged callback records outlive
      * the operation that registered them and would run against a later one.
      *
-     * @param \Illuminate\Contracts\Foundation\Application|null $base
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application|null $base
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return void
      */
     protected function rollBackTransactions($base, Application $sandbox): void
@@ -613,7 +613,7 @@ class ResetsRequestState
      * reached when an exception escapes the kernel, which leaves the previous operation's
      * controller instance attached to the route.
      *
-     * @param \Illuminate\Contracts\Foundation\Application $sandbox
+     * @param \Illuminate\Foundation\Application $sandbox
      * @return void
      */
     protected function flushRouteController(Application $sandbox): void
